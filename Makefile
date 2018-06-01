@@ -5,11 +5,11 @@ BINDIR := /usr/bin
 
 all: iasimage
 
-install: iasimage
+install: iasimage check
 	install -D --mode=0755 iasimage ${INSTALL_ROOT}${BINDIR}/iasimage
 
 check:
-	
+	python tests/test_iasimage.py
 
 .PHONY: all check install
 
