@@ -1,3 +1,4 @@
+[![Build Status](https://travis-ci.com/huang-jin-intel/iasimage.svg?branch=master)](https://travis-ci.com/huang-jin-intel/iasimage)
 
 iasimage
 -----------
