@@ -3,7 +3,7 @@
 iasimage
 -----------
 
-iasimage is a utility program for creating Intel Automotive Service (IAS) images, a binary file format understood by Intel© Slim Bootloader to load and initialize Operating Systems or Hypervisor.
+iasimage is a utility program for creating Intel Automotive Service (IAS) images, a binary file format understood by bootloaders to load and initialize Operating Systems or Hypervisors.
 
 iasimage supports the following features:
 
