@@ -295,8 +295,8 @@ def cmd_create(args):
     # Creating of Multi-file Boot image
     # Dummy files will be added if page alignment to 4KiB required
     if (image_type == IasHeader.TYPE_MULTIFILE_BOOT) or ((image_type == IasHeader.TYPE_UNKNOWN) and (len(files) > 1)):
-        if len(files) < 2:
-            print('Error: Please supply at least two input files')
+        if len(files) < 1:
+            print('Error: Please supply at least one input files')
             return 1
 
         # find number of required dummy files
@@ -402,7 +402,7 @@ def cmd_create(args):
         hdr.image_type |= IasHeader.SIGNATURE_PRESENT
         hdr.image_type |= IasHeader.PUBKEY_PRESENT
     hdr.version = 0
-    if len(files) > 1:
+    if len(files) >= 1:
         hdr.data_length = file_offset - sizeof(IasHeader) - len(files) * sizeof(c_uint32)
     else:
         hdr.data_length = file_offset - sizeof(IasHeader)
@@ -412,7 +412,7 @@ def cmd_create(args):
     ptr += sizeof(IasHeader)
 
     # Create extended header (for multiple files images, types 3,4,10) # in Type Specific Header field
-    if len(files) > 1:
+    if len(files) >= 1:
         ehdr_start = ptr
         ehdr_limit = ehdr_start + sizeof(c_uint32) * len(files)
         ehdr = (c_uint32 * len(files)).from_buffer(data, ehdr_start)
