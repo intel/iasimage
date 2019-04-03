@@ -83,7 +83,10 @@ MB = 1024 * KB
 def pack_num(val, minlen=0):
     buf = bytearray()
     while val > 0:
-        buf += bytes([val & 0xff])
+        if sys.version_info > (3,0):
+            buf += bytes([val & 0xff])
+        else:
+            buf += chr(val & 0xff)
         val >>= 8
     buf += bytearray(max(0, minlen - len(buf)))
     return buf
@@ -468,7 +471,7 @@ def cmd_create(args):
 
         mod_buf = pack_num(puk_num.n, RSA_KEYMOD_SIZE)
         exp_buf = pack_num(puk_num.e, RSA_KEYEXP_SIZE)
-        data += bytes([0xff] * (align_up(ptr, 256) - ptr))
+        data += bytearray([0xff] * (align_up(ptr, 256) - ptr))
         data += signature
         data += reverse_bytearray(mod_buf) + exp_buf
         print('Ok')
