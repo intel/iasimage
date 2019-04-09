@@ -10,6 +10,7 @@ install: iasimage check
 
 check:
 	python tests/test_iasimage.py
+	./iasimage -V
 
 .PHONY: all check install
 
