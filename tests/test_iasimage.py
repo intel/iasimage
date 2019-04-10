@@ -5,7 +5,8 @@ import subprocess
 import filecmp
 import shutil
 
-IASIMAGE='iasimage'
+IASIMAGE='iasimage.py'
+ENV='/usr/bin/env'
 
 class MyTests(unittest.TestCase):
 
@@ -25,11 +26,11 @@ class MyTests(unittest.TestCase):
 				pass
 
 	def test_help(self):
-		cmd = ['python', IASIMAGE, '-h']
+		cmd = [ENV, 'python', IASIMAGE, '-h']
 		subprocess.check_call(cmd)
 
 	def test_version(self):
-		cmd = ['python', IASIMAGE, '-V']
+		cmd = [ENV, 'python', IASIMAGE, '-V']
 		subprocess.check_call(cmd)
 
 	def test_create_and_extract_then_compare(self):
@@ -39,11 +40,11 @@ class MyTests(unittest.TestCase):
 			bz_f.write(b'b' * 1024 * 1024 * 2)
 		with open('initrd.bin', 'wb') as initrd_f:
 			initrd_f.write(b'f' * 1024 * 1024 * 3)
-		cmd = ['python', IASIMAGE, 'create', '-o', 'output.bin', 
+		cmd = [ENV, 'python', IASIMAGE, 'create', '-o', 'output.bin', 
 		       '-i', '0x30000', 'cmdline.txt', 'bzImage.bin', 'initrd.bin']
 		subprocess.check_call(cmd)
 
-		cmd = ['python', IASIMAGE, 'extract', 'output.bin']
+		cmd = [ENV, 'python', IASIMAGE, 'extract', 'output.bin']
 		subprocess.check_call(cmd)
 
 		self.assertTrue(filecmp.cmp('cmdline.txt', os.path.join('extract', 'image_0.bin')))
@@ -55,7 +56,7 @@ class MyTests(unittest.TestCase):
 			cmd_f.write(b'c' * 128)
 		with open('bzImage.bin', 'wb') as bz_f:
 			bz_f.write(b'b' * 1024 * 1024 * 2)
-		cmd = ['python', IASIMAGE, 'create', '-o', 'output.bin', 
+		cmd = [ENV, 'python', IASIMAGE, 'create', '-o', 'output.bin', 
 		       '-i', '0x30000', 'cmdline.txt', 'bzImage.bin']
 		subprocess.check_call(cmd)
 
@@ -77,7 +78,7 @@ class MyTests(unittest.TestCase):
 		subprocess.check_call(cmd)
 
 		# Attach signature to output.bin
-		cmd = ['python', IASIMAGE, 'sign', '-o', 'output.signed.bin', '-s', 'output.sig',
+		cmd = [ENV, 'python', IASIMAGE, 'sign', '-o', 'output.signed.bin', '-s', 'output.sig',
 		       '-k', 'public_key.pem', 'output.bin']
 		subprocess.check_call(cmd)
 
