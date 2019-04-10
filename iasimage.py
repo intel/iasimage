@@ -1,0 +1,637 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+#
+# Copyright © 2018 Intel Corporation. All rights reserved.
+# 
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+# 
+# * Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+# 
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+# 
+# * Neither the name of the copyright holder nor the names of its
+#   contributors may be used to endorse or promote products derived from
+#   this software without specific prior written permission.
+# 
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+################################################################################
+# Description:
+# 
+# IAS Image Tool
+# 
+# Supports creating, signing, and extracting components of an IAS image.
+# 
+# Requires Cryptography.
+#
+################################################################################
+
+
+from __future__ import print_function
+
+import argparse
+import os
+import os.path
+import struct
+import sys
+from ctypes import Structure, c_uint32, sizeof
+
+try:
+    from cryptography.hazmat.primitives import hashes as hashes
+    from cryptography.hazmat.primitives import serialization as serialization
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.asymmetric import padding as crypto_padding
+
+    # Check its version
+    import cryptography
+    if cryptography.__version__ < '2.2.2':
+        print("Error: Cryptography version must be 2.2.2 or higher"
+              " (installed version: {})".format(cryptography.__version__))
+        exit(1)
+
+except ImportError:
+    print("Error: Cryptography could not be found, please install using pip")
+    sys.exit(1)
+
+
+__version__ = "0.0.2"
+
+# -------------------------------------------------------------------------------
+
+RSA_KEYMOD_SIZE = 256
+RSA_KEYEXP_SIZE = 4
+KB = 1024
+MB = 1024 * KB
+
+
+def pack_num(val, minlen=0):
+    buf = bytearray()
+    while val > 0:
+        if sys.version_info > (3,0):
+            buf += bytes([val & 0xff])
+        else:
+            buf += chr(val & 0xff)
+        val >>= 8
+    buf += bytearray(max(0, minlen - len(buf)))
+    return buf
+
+
+def reverse_bytearray(byte_arr):
+    reverse_arr = bytearray(len(byte_arr))
+    for i in range(len(byte_arr)):
+        reverse_arr[i] = byte_arr[len(byte_arr) - i - 1]
+    return reverse_arr
+
+
+def is_pow_2(value):
+    return (value != 0) and ((value & (value - 1)) == 0)
+
+
+def align_up(value, alignment):
+    assert is_pow_2(alignment)
+    return (value + (alignment - 1)) & ~(alignment - 1)
+
+
+def human_size(size):
+    if size > MB:
+        out_size = size / float(MB)
+        return "%.1f MiB" % out_size
+    if size > KB:
+        out_size = size / float(KB)
+        return "%.1f KiB" % out_size
+    return "%d Bytes" % size
+
+
+# -------------------------------------------------------------------------------
+#
+#  CRC32C
+#
+_CRC32C_TABLE = (
+
+    0x00000000, 0xF26B8303, 0xE13B70F7, 0x1350F3F4, 0xC79A971F, 0x35F1141C, 0x26A1E7E8, 0xD4CA64EB,
+    0x8AD958CF, 0x78B2DBCC, 0x6BE22838, 0x9989AB3B, 0x4D43CFD0, 0xBF284CD3, 0xAC78BF27, 0x5E133C24,
+    0x105EC76F, 0xE235446C, 0xF165B798, 0x030E349B, 0xD7C45070, 0x25AFD373, 0x36FF2087, 0xC494A384,
+    0x9A879FA0, 0x68EC1CA3, 0x7BBCEF57, 0x89D76C54, 0x5D1D08BF, 0xAF768BBC, 0xBC267848, 0x4E4DFB4B,
+    0x20BD8EDE, 0xD2D60DDD, 0xC186FE29, 0x33ED7D2A, 0xE72719C1, 0x154C9AC2, 0x061C6936, 0xF477EA35,
+    0xAA64D611, 0x580F5512, 0x4B5FA6E6, 0xB93425E5, 0x6DFE410E, 0x9F95C20D, 0x8CC531F9, 0x7EAEB2FA,
+    0x30E349B1, 0xC288CAB2, 0xD1D83946, 0x23B3BA45, 0xF779DEAE, 0x05125DAD, 0x1642AE59, 0xE4292D5A,
+    0xBA3A117E, 0x4851927D, 0x5B016189, 0xA96AE28A, 0x7DA08661, 0x8FCB0562, 0x9C9BF696, 0x6EF07595,
+    0x417B1DBC, 0xB3109EBF, 0xA0406D4B, 0x522BEE48, 0x86E18AA3, 0x748A09A0, 0x67DAFA54, 0x95B17957,
+    0xCBA24573, 0x39C9C670, 0x2A993584, 0xD8F2B687, 0x0C38D26C, 0xFE53516F, 0xED03A29B, 0x1F682198,
+    0x5125DAD3, 0xA34E59D0, 0xB01EAA24, 0x42752927, 0x96BF4DCC, 0x64D4CECF, 0x77843D3B, 0x85EFBE38,
+    0xDBFC821C, 0x2997011F, 0x3AC7F2EB, 0xC8AC71E8, 0x1C661503, 0xEE0D9600, 0xFD5D65F4, 0x0F36E6F7,
+    0x61C69362, 0x93AD1061, 0x80FDE395, 0x72966096, 0xA65C047D, 0x5437877E, 0x4767748A, 0xB50CF789,
+    0xEB1FCBAD, 0x197448AE, 0x0A24BB5A, 0xF84F3859, 0x2C855CB2, 0xDEEEDFB1, 0xCDBE2C45, 0x3FD5AF46,
+    0x7198540D, 0x83F3D70E, 0x90A324FA, 0x62C8A7F9, 0xB602C312, 0x44694011, 0x5739B3E5, 0xA55230E6,
+    0xFB410CC2, 0x092A8FC1, 0x1A7A7C35, 0xE811FF36, 0x3CDB9BDD, 0xCEB018DE, 0xDDE0EB2A, 0x2F8B6829,
+    0x82F63B78, 0x709DB87B, 0x63CD4B8F, 0x91A6C88C, 0x456CAC67, 0xB7072F64, 0xA457DC90, 0x563C5F93,
+    0x082F63B7, 0xFA44E0B4, 0xE9141340, 0x1B7F9043, 0xCFB5F4A8, 0x3DDE77AB, 0x2E8E845F, 0xDCE5075C,
+    0x92A8FC17, 0x60C37F14, 0x73938CE0, 0x81F80FE3, 0x55326B08, 0xA759E80B, 0xB4091BFF, 0x466298FC,
+    0x1871A4D8, 0xEA1A27DB, 0xF94AD42F, 0x0B21572C, 0xDFEB33C7, 0x2D80B0C4, 0x3ED04330, 0xCCBBC033,
+    0xA24BB5A6, 0x502036A5, 0x4370C551, 0xB11B4652, 0x65D122B9, 0x97BAA1BA, 0x84EA524E, 0x7681D14D,
+    0x2892ED69, 0xDAF96E6A, 0xC9A99D9E, 0x3BC21E9D, 0xEF087A76, 0x1D63F975, 0x0E330A81, 0xFC588982,
+    0xB21572C9, 0x407EF1CA, 0x532E023E, 0xA145813D, 0x758FE5D6, 0x87E466D5, 0x94B49521, 0x66DF1622,
+    0x38CC2A06, 0xCAA7A905, 0xD9F75AF1, 0x2B9CD9F2, 0xFF56BD19, 0x0D3D3E1A, 0x1E6DCDEE, 0xEC064EED,
+    0xC38D26C4, 0x31E6A5C7, 0x22B65633, 0xD0DDD530, 0x0417B1DB, 0xF67C32D8, 0xE52CC12C, 0x1747422F,
+    0x49547E0B, 0xBB3FFD08, 0xA86F0EFC, 0x5A048DFF, 0x8ECEE914, 0x7CA56A17, 0x6FF599E3, 0x9D9E1AE0,
+    0xD3D3E1AB, 0x21B862A8, 0x32E8915C, 0xC083125F, 0x144976B4, 0xE622F5B7, 0xF5720643, 0x07198540,
+    0x590AB964, 0xAB613A67, 0xB831C993, 0x4A5A4A90, 0x9E902E7B, 0x6CFBAD78, 0x7FAB5E8C, 0x8DC0DD8F,
+    0xE330A81A, 0x115B2B19, 0x020BD8ED, 0xF0605BEE, 0x24AA3F05, 0xD6C1BC06, 0xC5914FF2, 0x37FACCF1,
+    0x69E9F0D5, 0x9B8273D6, 0x88D28022, 0x7AB90321, 0xAE7367CA, 0x5C18E4C9, 0x4F48173D, 0xBD23943E,
+    0xF36E6F75, 0x0105EC76, 0x12551F82, 0xE03E9C81, 0x34F4F86A, 0xC69F7B69, 0xD5CF889D, 0x27A40B9E,
+    0x79B737BA, 0x8BDCB4B9, 0x988C474D, 0x6AE7C44E, 0xBE2DA0A5, 0x4C4623A6, 0x5F16D052, 0xAD7D5351
+)
+
+def crc32c(byte, crc=0xffffffff):
+    """Calculate CRC of single Byte."""
+    crc = (crc >> 8) ^ _CRC32C_TABLE[(crc ^ byte) & 0xff]
+    return crc
+
+def crc32c_buf(buf, crc=0xffffffff):
+    """Calculate CRC of of a full buffer."""
+    for byte in buf:
+        crc = crc32c(byte, crc)
+    return crc
+
+# -------------------------------------------------------------------------------
+
+class IasHeader(Structure):
+    MAGIC = bytearray([0x2e, 0x6b, 0x70, 0x69]) # ".kpi".encode("Latin-1")
+    SIGNATURE_PRESENT = 0x100  # RSA signature present
+    PUBKEY_PRESENT = 0x200  # Public Key present
+    # Image types:
+    #  Unspecified image type:
+    TYPE_UNKNOWN = 0x00000  # unspecified (unknown) image
+    #  Multiple files image types:
+    TYPE_MULTIFILE_BOOT = 0x30000  # Multi-file boot image
+    TYPE_ELF_MULTI_BOOT = 0x40000  # ELF Multiboot compliant boot image
+    TYPE_FW_PACKAGE = 0xA0000  # Firmware package
+    #  Single file image types
+    TYPE_KERNEL_CMDLINE = 0x10000  # Linux command line - DEPRECATED
+    TYPE_KERNEL_BZIMAGE = 0x20000  # Linux kernel (bzImage) - DEPRECATED
+    TYPE_UPDATE_PACKAGE = 0x50000  # Update Package Image with extra header
+    TYPE_ABL_CONFIG = 0x60000  # ABL configuration image
+    TYPE_MRC_TRAINING_PARAM = 0x70000  # MRC training parameter
+    TYPE_IFWI_UPDATE_PACKAGE = 0x80000  # IFWI update package
+    TYPE_PDR_UPDATE_PACKAGE = 0x90000  # PDR update package
+    TYPE_PREOS_CHECKER = 0xB0000  # Pre-OS checker image
+    _pack_ = 1
+    _fields_ = [
+        ('magic_pattern', c_uint32),  # Identifies structure (acts as valid flag)
+        ('image_type', c_uint32),  # Image and compression type
+        ('version', c_uint32),  # Header version
+        ('data_length', c_uint32),  # Size of payload (data) in image
+        ('data_offset', c_uint32),  # Offset to payload data from header
+        ('uncompressed_len', c_uint32),  # Uncompressed data length
+        ('header_crc', c_uint32)  # CRC-32C over entire header
+    ]
+
+
+def cmd_create(args):
+    """Create an ias-image"""
+    print('Creating ias-image with %d files' % len(args.file))
+
+    # dictionary with image types names
+    image_types_names = {IasHeader.TYPE_UNKNOWN: 'Unspecified', \
+                         IasHeader.TYPE_KERNEL_CMDLINE: 'Linux command line', \
+                         IasHeader.TYPE_KERNEL_BZIMAGE: 'Linux kernel (bzImage)', \
+                         IasHeader.TYPE_MULTIFILE_BOOT: 'Multi-file boot image', \
+                         IasHeader.TYPE_ELF_MULTI_BOOT: 'Stand-alone ELF multi-boot', \
+                         IasHeader.TYPE_UPDATE_PACKAGE: 'Update Package Image with extra header', \
+                         IasHeader.TYPE_ABL_CONFIG: 'ABL Configuration', \
+                         IasHeader.TYPE_MRC_TRAINING_PARAM: 'MRC training parameter set', \
+                         IasHeader.TYPE_IFWI_UPDATE_PACKAGE: 'IFWI update package', \
+                         IasHeader.TYPE_PDR_UPDATE_PACKAGE: 'PDR update package', \
+                         IasHeader.TYPE_FW_PACKAGE: 'Firmware package', \
+                         IasHeader.TYPE_PREOS_CHECKER: 'Pre-OS checker'}
+
+    # list of all multiple files image types
+    multi_files_image_type = [IasHeader.TYPE_UNKNOWN, \
+                              IasHeader.TYPE_MULTIFILE_BOOT, \
+                              IasHeader.TYPE_ELF_MULTI_BOOT, \
+                              IasHeader.TYPE_FW_PACKAGE]
+
+    # process command line parameters
+    verbose = args.verbose
+    if args.imagetype != None:
+        try:
+            image_type = int(args.imagetype, 0) & 0xF0000
+        except ValueError:
+            print("Error: No digits were found")
+            return 1
+        if image_type not in image_types_names:
+            print("Error: Not supported type image")
+            return 1
+        public_key_present = int(args.imagetype, 0) & IasHeader.PUBKEY_PRESENT
+        signature_present = int(args.imagetype, 0) & IasHeader.SIGNATURE_PRESENT
+    else:
+        image_type = int(IasHeader.TYPE_UNKNOWN)
+        public_key_present = 0
+        signature_present = 0
+    page_aligned_num = 0
+
+    print('Detected image type is (0x%x) - %s' % (image_type, image_types_names[image_type]))
+
+    # set values of alignment
+    if args.page_aligned is None:
+        if verbose > 0:
+            print("Files in image will not be page aligned")
+    elif int(args.page_aligned) >= 0:
+        page_aligned_num = int(args.page_aligned)
+        # correct to default value if necessary
+        if (page_aligned_num == 0) and (image_type == IasHeader.TYPE_MULTIFILE_BOOT):
+            page_aligned_num = 5
+            if verbose > 0:
+                print('Creation of Multi-file boot image, default alignment from %d file' % page_aligned_num)
+        elif (page_aligned_num == 0) and (image_type == IasHeader.TYPE_ELF_MULTI_BOOT):
+            page_aligned_num = 4
+            if verbose > 0:
+                print('Creation of Stand-alone ELF multi-boot image, default alignment from %d file' % page_aligned_num)
+        elif (page_aligned_num == 0) and (image_type == IasHeader.TYPE_FW_PACKAGE):
+            page_aligned_num = 2
+            if verbose > 0:
+                print('Creation of Firmware Package Image, default alignment from %d file' % page_aligned_num)
+        elif (page_aligned_num >= 0) and (multi_files_image_type.count(image_type) == 0):
+            sys.stderr.write(
+                'Page alignment not supported for image type 0x%x (%s)\n' % (image_type, image_types_names[image_type]))
+            return 1
+        elif (page_aligned_num == 0) and (image_type == IasHeader.TYPE_UNKNOWN):
+            page_aligned_num = 2  # default value for Unknown image
+
+    if (verbose > 0) and (args.page_aligned != None):
+        print('Page alignment for image from file %d detected' % page_aligned_num)
+
+    # Read file data
+    files = []
+    for fpath in args.file:
+        try:
+            with open(fpath, 'rb') as input_file:
+                sys.stdout.write('  %s ' % fpath)  # file path #
+                files.append(bytearray(input_file.read()))
+        except IOError:
+            print('Error: No such file or directory: %s' % fpath)
+            return 1
+        print("(%s)" % human_size(len(files[-1])))  # file size #
+
+    # check if there is enough files for page alignment, otherwise error
+    if page_aligned_num > len(files):
+        sys.stderr.write('Error. Page alignment number %d is higher than a number of input files %d\n' % (
+            page_aligned_num, len(files)))
+        return 1
+
+    # Creating of Multi-file Boot image
+    # Dummy files will be added if page alignment to 4KiB required
+    if (image_type == IasHeader.TYPE_MULTIFILE_BOOT) or ((image_type == IasHeader.TYPE_UNKNOWN) and (len(files) > 1)):
+        if len(files) < 1:
+            print('Error: Please supply at least one input files')
+            return 1
+
+        # find number of required dummy files
+        if args.page_aligned is None:
+            dummy_files = 0
+        else:
+            dummy_files = len(files) - page_aligned_num + 1
+
+        if verbose > 2:
+            print('%d dummy files will be added to page align the image' % dummy_files)
+
+        # set initial file offset (payload data offset in image)
+        # Type specific header length   = 4 bytes (c_uint32) * number of files (input files + dummy files)
+        file_offset = sizeof(IasHeader) + sizeof(c_uint32) * len(files) + sizeof(c_uint32) * dummy_files
+
+        temp_len = 0
+        while temp_len < len(files):
+            if ((temp_len + 1) >= page_aligned_num) and (page_aligned_num != 0):
+                # calculate size of dummy file
+                dummy_size = align_up(file_offset, 4 * KB) - file_offset  #
+                if dummy_size >= 0:
+                    if verbose > 1:
+                        print('Adding 0x%x (%d) bytes size dummy file' % (dummy_size, dummy_size))
+                    files.insert(temp_len, bytearray(dummy_size))  # create array with dummy data
+                    temp_len += 1  # set iteration to skip this file
+                    file_offset += dummy_size
+                # align up to 4B
+                file_offset += align_up(len(files[temp_len]), 4)
+                if verbose > 1:
+                    print('Adding file of size: %d (0x%x)' % (len(files[temp_len]), len(files[temp_len])))
+            else:  # align up to 4B only
+                padding = align_up(len(files[temp_len]), 4) - len(files[temp_len])
+                if verbose > 2:
+                    print(' Adding 0x%x (%d) pad bytes to align file to 0x4' % (padding, padding))
+                file_offset += padding
+                file_offset += len(files[temp_len])
+
+            temp_len += 1  # set to next file
+            if verbose > 2:
+                print('File offset is %d (0x%x)' % (file_offset, file_offset))
+
+    # Creating of:
+    # - Firmware-package image
+    # - Elf-multiboot image
+    # Command line files will be extended with 0x0 at the end if page alignment to 4KiB required
+    elif (image_type == IasHeader.TYPE_ELF_MULTI_BOOT) or (image_type == IasHeader.TYPE_FW_PACKAGE):
+        # initialize file offset (payload data start) in image
+        file_offset = sizeof(IasHeader) + sizeof(c_uint32) * len(files)
+
+        for temp_len in range(len(files)):
+            # check if processing cmdline file
+            if ((temp_len + 1) >= (page_aligned_num - 1)) and (((temp_len + 1) % 2) == 1) and (page_aligned_num != 0):
+                # calculate padding
+                padding = align_up(file_offset + len(files[temp_len]), 4 * KB) - (file_offset + len(files[temp_len]))
+                if padding > 0:  # align up to 4KiB
+                    if verbose > 1:
+                        print('Adding 0x%x (%d) pad bytes to align cmdline' % (padding, padding))
+                    files[temp_len] += bytearray(padding)
+                    # add padding 0x0 bytes to file (cmdLine)
+                file_offset += len(files[temp_len])
+            else:  # align up to 4B only
+                padding = align_up(len(files[temp_len]), 4) - len(files[temp_len])
+                if verbose > 2:
+                    print('Adding 0x%x (%d) pad bytes to align binary to 0x4' % (padding, padding))
+                file_offset += padding
+                file_offset += len(files[temp_len])
+
+            if verbose > 2:
+                print('File offset is %d (0x%x)' % (file_offset, file_offset))
+
+    # single-file images
+    # Only alignment to 4 bytes for file will be added
+    else:
+        if len(files) > 1:
+            sys.stderr.write('Error: Please supply only one input file\n')
+            return 1
+
+        file_offset = sizeof(IasHeader)
+        padding = align_up(len(files[0]), 4) - len(files[0])
+        if verbose > 2:
+            print('Note: Adding 0x%x (%d) pad bytes to align file to 0x4' % (padding, padding))
+        file_offset += padding
+        file_offset += len(files[0])
+
+    # set image size
+    image_size = file_offset
+    image_size += sizeof(c_uint32)  # Checksum at the end of image payload
+
+    # declare array for all files
+    data = bytearray(image_size)
+    ptr = 0
+
+    # Create header
+    hdr = IasHeader.from_buffer(data, ptr)
+    hdr.magic_pattern = struct.unpack(">I", IasHeader.MAGIC)[0]  # ">I" big endian 4 bytes (integer)
+    if args.imagetype is None:
+        hdr.image_type = image_type
+    else:
+        hdr.image_type = int(args.imagetype, 0)
+    if args.devkey:
+        if (not public_key_present) | (not signature_present):
+            print('WARNING: No public key or signature flag in image type, adding both')
+        hdr.image_type |= IasHeader.SIGNATURE_PRESENT
+        hdr.image_type |= IasHeader.PUBKEY_PRESENT
+    hdr.version = 0
+    if len(files) >= 1:
+        hdr.data_length = file_offset - sizeof(IasHeader) - len(files) * sizeof(c_uint32)
+    else:
+        hdr.data_length = file_offset - sizeof(IasHeader)
+    hdr.data_offset = 0
+    hdr.uncompressed_len = hdr.data_length
+    hdr.header_crc = 0
+    ptr += sizeof(IasHeader)
+
+    # Create extended header (for multiple files images, types 3,4,10) # in Type Specific Header field
+    if len(files) >= 1:
+        ehdr_start = ptr
+        ehdr_limit = ehdr_start + sizeof(c_uint32) * len(files)
+        ehdr = (c_uint32 * len(files)).from_buffer(data, ehdr_start)
+        for i in range(len(files)):
+            ehdr[i] = len(files[i])
+            print('File %d size %d bytes' % (i + 1, ehdr[i]))
+        ptr = ehdr_limit
+
+    hdr.data_offset = ptr
+    hdr.header_crc = crc32c_buf(data[0:24])
+
+    # Add file data
+    for item in range(len(files)):
+        f_start = ptr
+        f_limit = f_start + len(files[item])
+        if verbose > 1:
+            print('Adding file %d @ [0x%08x-0x%08x]' % (item + 1, f_start, f_limit))
+        data[f_start:f_limit] = files[item]
+        ptr = align_up(f_limit, 4)
+
+    # Add payload checksum
+    crc_start = ptr
+    crc_limit = crc_start + sizeof(c_uint32)
+    crc = c_uint32.from_buffer(data, crc_start)
+    sys.stdout.write('Calculating Checksum... ')
+    crc.value = crc32c_buf(data[sizeof(hdr):hdr.data_offset + hdr.data_length])
+    print('Ok')
+    ptr = crc_limit
+
+    # delete all the views that will prevent resizing the data buffer when
+    # signing
+    del hdr
+    del ehdr
+    del crc
+
+    if args.devkey:
+        sys.stdout.write('Signing... ')
+        try:
+            with open(args.devkey, 'rb') as rsa_key_file:
+                key = serialization.load_pem_private_key(
+                        rsa_key_file.read(),
+                        password=None,
+                        backend=default_backend()
+                    )
+        except IOError:
+            print('Error: No such file or directory: %s' % args.devkey)
+            return 1
+        # Calculate a PKCS#1 v1.5 signature
+        signature = key.sign(bytes(data),  crypto_padding.PKCS1v15(), hashes.SHA256())
+        # Extract public key from loaded key
+        puk = key.public_key()
+        puk_num = puk.public_numbers()
+
+        mod_buf = pack_num(puk_num.n, RSA_KEYMOD_SIZE)
+        exp_buf = pack_num(puk_num.e, RSA_KEYEXP_SIZE)
+        data += bytearray([0xff] * (align_up(ptr, 256) - ptr))
+        data += signature
+        data += reverse_bytearray(mod_buf) + exp_buf
+        print('Ok')
+
+    # Write file out
+    sys.stdout.write('Writing... ')
+    with open(args.output, 'wb') as output_file:
+        output_file.write(data)
+    print('Ok')
+
+    return 0
+
+
+def cmd_sign(args):
+    """Sign an ias-image"""
+    try:
+        with open(args.file, 'rb') as input_file:
+            data = bytearray(input_file.read())
+    except IOError:
+        print('Error: No such file or directory: %s' % args.file)
+        return 1
+
+    try:
+        with open(args.signature, 'rb') as signature_file:
+            signature = signature_file.read()
+    except IOError:
+        print('Error: No such file or directory: %s' % args.signature)
+        return 1
+
+    if args.key:
+        sys.stdout.write('Verification of signature with public key... ')
+        with open(args.key, 'rb') as public_key_file:
+            key = serialization.load_pem_public_key(public_key_file.read(),
+                                                    default_backend())
+        try:
+            key.verify(signature, bytes(data), crypto_padding.PKCS1v15(), hashes.SHA256())
+            print('Ok')
+        except:
+            print('failed')
+            return 1
+
+    sys.stdout.write('Signing... ')
+    ptr = len(data)
+    data += bytearray([0xff] * (align_up(ptr, 256) - ptr))
+    data += signature
+
+    if args.key:
+        puk_num = key.public_numbers()
+        mod_buf = pack_num(puk_num.n, RSA_KEYMOD_SIZE)
+        exp_buf = pack_num(puk_num.e, RSA_KEYEXP_SIZE)
+        data += reverse_bytearray(mod_buf) + exp_buf
+
+    print('Ok')
+
+    # Write file out
+    sys.stdout.write('Writing... ')
+    with open(args.output, 'wb') as output_file:
+        output_file.write(data)
+    print('Ok')
+
+
+def cmd_extract(args):
+    """Extract components from an IASImage"""
+    # Read IasImage
+    with open(args.file, 'rb') as input_file:
+        data = bytearray(input_file.read())
+
+    # Check header
+    hdr = IasHeader.from_buffer(data)
+    if hdr.magic_pattern != struct.unpack(">I", IasHeader.MAGIC)[0]:
+        print('Invalid header magic')
+        return 1
+
+    off_len = []
+
+    # Check for multiple images
+    num_images = int((hdr.data_offset - sizeof(IasHeader)) / sizeof(c_uint32))
+
+    if num_images == 0:
+        # Just one image is present
+        off_len.append((hdr.data_offset, hdr.data_length))
+    else:
+        # Gap between header and data indicates an extended header is present.
+        # The extended header contains an array of 32-bit integers, each
+        # indicating the size of the respective image.
+        print('Found %d images' % num_images)
+        sizes = (c_uint32 * num_images).from_buffer(
+            data[sizeof(IasHeader):sizeof(IasHeader) + num_images * sizeof(c_uint32)])
+        ptr = hdr.data_offset
+        for i in range(num_images):
+            off_len.append((ptr, sizes[i]))
+            ptr += align_up(sizes[i], 4)  # Images are 32-bit aligned
+
+    # Extract images
+    if not os.path.exists('extract'):
+        os.makedirs('extract')
+    count = 0
+    for ioff, ilen in off_len:
+        print('Extracting Image %d @ [0x%08x-0x%08x]' % (count, ioff, ioff + ilen))
+        with open(os.path.join('extract', 'image_%d.bin' % count), 'wb') as input_file:
+            input_file.write(data[ioff:ioff + ilen])
+        count += 1
+
+    print('Ok')
+
+
+def main():
+    arg_parser = argparse.ArgumentParser()
+    arg_subparser = arg_parser.add_subparsers(help='command')
+
+    cmd_createp = arg_subparser.add_parser('create', help='create ias-image',
+                                          formatter_class=argparse.RawTextHelpFormatter)
+    cmd_createp.add_argument('-o', '--output', help='output filename')
+    cmd_createp.add_argument('-d', '--devkey',
+                             help='private key for internal signing - used during development phase (RSA signature and public key will be appended to image)')
+    cmd_createp.add_argument('-i', '--imagetype', help='\
+image type: 32bit-value decimal [197376] or hexadecimal [0x30300]\n\
+ [BIT 31-16: Image type]\n\
+ [BIT 15-10: Reserved]\n\
+ [BIT 9:     Public Key present]\n\
+ [BIT 8:     RSA signature present]\n\
+ [BIT 7-0:   Compression algorithm]\n\
+ Image type - BIT field:\n\
+  [3 : Multi-file boot image]\n\
+  [4 : ELF Multiboot compliant boot image]\n\
+  [5 : SPI update package]\n\
+  [6 : ABL configuration image]\n\
+  [7 : MRC training parameter]\n\
+  [8 : IFWI update package]\n\
+  [9 : PDR update package]\n\
+  [10: Firmware package]\n\
+  [11: Pre-OS checker image]')
+    cmd_createp.add_argument('-p', '--page-aligned', default=None, const='0', nargs='?',
+                             help='file number before which image should be page aligned')
+    cmd_createp.add_argument('-v', '--verbose', action='count')
+    cmd_createp.add_argument('file', nargs='+')
+    cmd_createp.set_defaults(output='iasImage')
+    cmd_createp.set_defaults(verbose=0)
+    cmd_createp.set_defaults(func=cmd_create)
+
+    cmd_signp = arg_subparser.add_parser('sign', help='sign ias-image')
+    cmd_signp.add_argument('-o', '--output', help='output filename')
+    cmd_signp.add_argument('-k', '--key', help='public key')
+    cmd_signp.add_argument('-s', '--signature', required=True, help='RSA signature')
+    cmd_signp.add_argument('file')
+    cmd_signp.set_defaults(output='iasImage')
+    cmd_signp.set_defaults(func=cmd_sign)
+
+    cmd_extractp = arg_subparser.add_parser('extract', help='extract ias-image components')
+    cmd_extractp.add_argument('file')
+    cmd_extractp.set_defaults(func=cmd_extract)
+
+    arg_parser.add_argument('-V', '--version', action='version', version='%(prog)s ' + __version__)
+
+    args = arg_parser.parse_args()
+    if not 'func' in args:
+        arg_parser.print_usage()
+        sys.exit(2)
+    sys.exit(args.func(args))
+
+
+if __name__ == '__main__':
+    main()
